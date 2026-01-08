@@ -1,0 +1,308 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include "SD_MMC.h"
+
+// --- USER CONFIG (Kept from your working code) ---
+const char* ssid = "iPhone";       
+const char* password = "aassddff"; 
+
+WebServer server(80);
+
+// System State
+int stm_engaged = 0;
+int stm_angle = 0;
+float stm_dist = 0.0;
+
+// ================= PROFESSIONAL DASHBOARD HTML =================
+// Contains custom JavaScript for Offline Graphing & UI Logic
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Musashi Telemetry</title>
+  <style>
+    :root { --bg: #121212; --card: #1e1e1e; --text: #e0e0e0; --accent: #00d2ff; --green: #00ff88; --red: #ff4d4d; }
+    body { font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: var(--bg); color: var(--text); margin: 0; padding: 20px; text-align: center; }
+    
+    /* LAYOUT GRID */
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; max-width: 1200px; margin: 0 auto; }
+    .card { background-color: var(--card); border-radius: 12px; padding: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); border: 1px solid #333; }
+    
+    h1 { color: var(--accent); letter-spacing: 2px; margin-bottom: 5px; text-transform: uppercase; font-size: 1.5rem; }
+    h2 { font-size: 1rem; color: #888; margin-top: 0; }
+    h3 { margin: 0 0 10px 0; font-size: 0.9rem; color: #aaa; text-align: left; border-bottom: 1px solid #333; padding-bottom: 5px; }
+
+    /* BIG NUMBERS */
+    .metric-value { font-size: 2.5rem; font-weight: bold; font-family: monospace; }
+    .unit { font-size: 1rem; color: #666; }
+    
+    /* DYNAMIC BUTTON */
+    .btn-main {
+      width: 100%; padding: 20px; font-size: 1.5rem; font-weight: bold; border: none; border-radius: 8px; cursor: pointer;
+      transition: all 0.2s ease; text-transform: uppercase; box-shadow: 0 0 15px rgba(0,0,0,0.3);
+    }
+    .btn-eng { background: linear-gradient(135deg, var(--green), #00b359); color: #000; }
+    .btn-dis { background: linear-gradient(135deg, var(--red), #b30000); color: #fff; }
+    .btn-main:active { transform: scale(0.98); }
+
+    /* GRAPHS */
+    canvas { width: 100%; height: 150px; background: #181818; border-radius: 4px; border-left: 2px solid #444; border-bottom: 2px solid #444; }
+    .status-badge { display: inline-block; padding: 5px 12px; border-radius: 15px; font-size: 0.8rem; font-weight: bold; margin-bottom: 15px; }
+    .st-on { background: rgba(0,255,136,0.2); color: var(--green); border: 1px solid var(--green); }
+    .st-off { background: rgba(255,77,77,0.2); color: var(--red); border: 1px solid var(--red); }
+
+  </style>
+</head>
+<body>
+
+  <h1>Musashi R&D</h1>
+  <h2>Control & Telemetry System</h2>
+
+  <div class="grid">
+    
+    <div class="card" style="grid-column: 1 / -1;">
+      <div id="statusBadge" class="status-badge st-off">SYSTEM STANDBY</div>
+      <button id="mainBtn" class="btn-main btn-eng" onclick="toggleSystem()">ENGAGE SYSTEM</button>
+    </div>
+
+    <div class="card">
+      <h3>CURRENT ANGLE</h3>
+      <div class="metric-value"><span id="valAngle">0</span><span class="unit">°</span></div>
+    </div>
+    
+    <div class="card">
+      <h3>LINEAR DISTANCE</h3>
+      <div class="metric-value"><span id="valDist">0.0</span><span class="unit">cm</span></div>
+    </div>
+
+    <div class="card" style="grid-column: 1 / -1;">
+      <h3>ENGAGEMENT STATE (Logic 0/1)</h3>
+      <canvas id="chartState"></canvas>
+    </div>
+
+    <div class="card">
+      <h3>ANGLE HISTORY (0-180°)</h3>
+      <canvas id="chartAngle"></canvas>
+    </div>
+
+    <div class="card">
+      <h3>DISTANCE TRAVEL (0-10cm)</h3>
+      <canvas id="chartDist"></canvas>
+    </div>
+
+    <div class="card" style="grid-column: 1 / -1;">
+      <a href="/download" style="color:#666; text-decoration:none; font-size:0.8rem;">[ DOWNLOAD DATALOG.CSV ]</a>
+    </div>
+  </div>
+
+<script>
+  // --- OFFLINE GRAPHING ENGINE ---
+  const MAX_POINTS = 100;
+  
+  class Graph {
+    constructor(canvasId, color, maxVal) {
+      this.canvas = document.getElementById(canvasId);
+      this.ctx = this.canvas.getContext('2d');
+      this.data = new Array(MAX_POINTS).fill(0);
+      this.color = color;
+      this.maxVal = maxVal;
+      this.canvas.width = this.canvas.offsetWidth;
+      this.canvas.height = this.canvas.offsetHeight;
+    }
+
+    add(val) {
+      this.data.push(val);
+      this.data.shift();
+      this.draw();
+    }
+
+    draw() {
+      const w = this.canvas.width;
+      const h = this.canvas.height;
+      const ctx = this.ctx;
+      
+      ctx.clearRect(0, 0, w, h);
+      
+      // Grid
+      ctx.strokeStyle = '#333';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(0, h/2); ctx.lineTo(w, h/2);
+      ctx.stroke();
+
+      // Line
+      ctx.strokeStyle = this.color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      
+      const step = w / (MAX_POINTS - 1);
+      
+      for(let i=0; i<MAX_POINTS; i++) {
+        // Map value to height (invert Y because canvas 0 is top)
+        let y = h - ( (this.data[i] / this.maxVal) * (h - 10) ) - 5;
+        if(i===0) ctx.moveTo(0, y);
+        else ctx.lineTo(i * step, y);
+      }
+      ctx.stroke();
+      
+      // Fill
+      ctx.fillStyle = this.color + "33"; // Add transparency
+      ctx.lineTo((MAX_POINTS-1)*step, h);
+      ctx.lineTo(0, h);
+      ctx.fill();
+    }
+  }
+
+  // Init Graphs
+  const gState = new Graph('chartState', '#00ff88', 1.2); 
+  const gAngle = new Graph('chartAngle', '#00d2ff', 180);
+  const gDist  = new Graph('chartDist',  '#ffae00', 10);
+
+  // --- LOGIC ---
+  let currentState = 0;
+
+  function updateDashboard() {
+    fetch('/status').then(r => r.json()).then(d => {
+      currentState = d.s;
+      
+      // 1. Update Numbers
+      document.getElementById('valAngle').innerText = d.a;
+      document.getElementById('valDist').innerText = d.d;
+
+      // 2. Update Graphs
+      gState.add(d.s);
+      gAngle.add(d.a);
+      gDist.add(d.d);
+
+      // 3. Update Button & Badge
+      const btn = document.getElementById('mainBtn');
+      const badge = document.getElementById('statusBadge');
+      
+      if(d.s === 1) {
+        // If Engaged
+        btn.innerText = "DISENGAGE SYSTEM";
+        btn.className = "btn-main btn-dis";
+        badge.innerText = "SYSTEM ACTIVE";
+        badge.className = "status-badge st-on";
+      } else {
+        // If Disengaged
+        btn.innerText = "ENGAGE SYSTEM";
+        btn.className = "btn-main btn-eng";
+        badge.innerText = "SYSTEM STANDBY";
+        badge.className = "status-badge st-off";
+      }
+    });
+  }
+
+  function toggleSystem() {
+    // Send toggle command - STM32 will handle the state change
+    const cmd = currentState === 1 ? '0' : '1';
+    fetch('/toggle?v=' + cmd).then(() => {
+      // Immediately update display for better UX
+      updateDashboard();
+    });
+  }
+
+  // Loop
+  setInterval(updateDashboard, 200); // 5Hz update rate
+
+  // Resize handler for canvas
+  window.onresize = function() {
+    [gState, gAngle, gDist].forEach(g => {
+        g.canvas.width = g.canvas.offsetWidth;
+        g.canvas.height = g.canvas.offsetHeight;
+    });
+  };
+</script>
+</body>
+</html>
+)rawliteral";
+
+void setup() {
+  Serial.begin(115200);
+  
+  // --- CONNECT TO STM32 ---
+  // RX=4, TX=5 (Same as your working setup)
+  Serial2.begin(115200, SERIAL_8N1, 4, 5); 
+
+  // --- SD CARD ---
+  if(!SD_MMC.begin()){ Serial.println("SD Failed"); } 
+  else { 
+    // Creating a CSV for better data analysis with Distance column
+    if(!SD_MMC.exists("/datalog.csv")) {
+       File f = SD_MMC.open("/datalog.csv", FILE_WRITE);
+       if(f) { f.println("Time_ms,State,Angle,Distance_cm"); f.close(); }
+    }
+  }
+
+  // --- WIFI ---
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to iPhone");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.print("DASHBOARD IP: "); Serial.println(WiFi.localIP());
+
+  // --- ROUTES ---
+  server.on("/", []() { server.send(200, "text/html", index_html); });
+  
+  // New Toggle Route for Single Button
+  server.on("/toggle", []() {
+    if (server.hasArg("v")) {
+      char cmd = server.arg("v").charAt(0);
+      Serial2.print(cmd); // Send to STM32
+    }
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/status", []() {
+    // Calculate Distance: (Angle / 180) * 10cm
+    stm_dist = ((float)stm_angle / 180.0) * 10.0;
+    
+    // Create JSON: { "s": 1, "a": 90, "d": 5.0 }
+    String json = "{\"s\":" + String(stm_engaged) + 
+                  ",\"a\":" + String(stm_angle) + 
+                  ",\"d\":" + String(stm_dist, 1) + "}";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/download", []() {
+    File file = SD_MMC.open("/datalog.csv");
+    if(file) { server.streamFile(file, "text/csv"); file.close(); } 
+    else server.send(404, "text/plain", "No Data");
+  });
+
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+
+  // Read STM32 Data
+  while (Serial2.available()) {
+    String line = Serial2.readStringUntil('\n');
+    int comma = line.indexOf(',');
+    
+    if (comma > 0) {
+      stm_engaged = line.substring(0, comma).toInt();
+      stm_angle = line.substring(comma + 1).toInt();
+      
+      // Calculate dist for logging
+      float d = ((float)stm_angle / 180.0) * 10.0;
+
+      // Log to SD (Using CSV format now)
+      File f = SD_MMC.open("/datalog.csv", FILE_APPEND);
+      if(f) { 
+        f.print(millis()); f.print(","); 
+        f.print(stm_engaged); f.print(",");
+        f.print(stm_angle); f.print(",");
+        f.println(d); 
+        f.close(); 
+      }
+    }
+  }
+}

@@ -1,0 +1,111 @@
+#include "stm32f1xx.h"
+#include <stdio.h> 
+
+// --- TIMING ---
+volatile uint32_t ticks_ms = 0;
+void SysTick_Handler(void) { ticks_ms++; }
+void delay_init(void) { SysTick_Config(8000000 / 1000); }
+uint32_t millis(void) { return ticks_ms; }
+void delay_us(volatile uint32_t x) { x*=6; while(x--) __NOP(); }
+
+// --- UART (To ESP32) ---
+void usart_init(void) {
+    RCC->APB2ENR |= RCC_APB2ENR_USART1EN | RCC_APB2ENR_IOPAEN;
+    // PA9 (TX) -> Alt Func Push-Pull
+    GPIOA->CRH &= ~(0xF << 4); GPIOA->CRH |= (0xB << 4);
+    // PA10 (RX) -> Input Pull-Up (Prevents noise)
+    GPIOA->CRH &= ~(0xF << 8); GPIOA->CRH |= (0x8 << 8); GPIOA->ODR |= (1 << 10); 
+    // Baud 115200 @ 8MHz
+    USART1->BRR = 0x45; 
+    USART1->CR1 |= USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
+}
+void usart_send(char c) { while (!(USART1->SR & USART_SR_TXE)); USART1->DR = c; }
+void usart_print(char *str) { while (*str) usart_send(*str++); }
+int usart_available(void) { return (USART1->SR & USART_SR_RXNE); }
+char usart_read(void) { return (char)(USART1->DR); }
+
+// --- HARDWARE ---
+void gpio_init(void) {
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_IOPBEN | RCC_APB2ENR_IOPCEN;
+    // PA1 IR (Input Pullup)
+    GPIOA->CRL &= ~(0xF<<4); GPIOA->CRL |= (0x8<<4); GPIOA->ODR |= (1<<1);
+    // PC2 Btn (Input Pullup)
+    GPIOC->CRL &= ~(0xF<<8); GPIOC->CRL |= (0x8<<8); GPIOC->ODR |= (1<<2);
+    // LEDs PC0, PC3
+    GPIOC->CRL &= ~(0xF<<0); GPIOC->CRL |= (0x2<<0); 
+    GPIOC->CRL &= ~(0xF<<12); GPIOC->CRL |= (0x2<<12);
+}
+void adc_init(void) {
+    RCC->APB2ENR |= RCC_APB2ENR_ADC1EN; ADC1->CR2 |= ADC_CR2_ADON; 
+    for(int i=0;i<1000;i++); ADC1->CR2 |= ADC_CR2_CAL; while(ADC1->CR2 & ADC_CR2_CAL);
+}
+uint16_t adc_read(void) {
+    ADC1->SQR3=0; ADC1->CR2|=ADC_CR2_ADON; while(!(ADC1->SR & ADC_SR_EOC)); return ADC1->DR;
+}
+void servo_init(void) {
+    RCC->APB1ENR |= RCC_APB1ENR_TIM4EN; 
+    GPIOB->CRL &= ~(0xF<<28); GPIOB->CRL |= (0xA<<28); // PB7
+    TIM4->PSC = 7; TIM4->ARR = 19999;
+    TIM4->CCMR1 = (6<<12)|TIM_CCMR1_OC2PE; TIM4->CCER|=TIM_CCER_CC2E; TIM4->CR1|=TIM_CR1_CEN;
+}
+void set_servo(int a) { if(a<0)a=0; if(a>180)a=180; TIM4->CCR2=600+(a*1800/180); }
+
+// --- MAIN ---
+int main(void) {
+    delay_init(); gpio_init(); adc_init(); servo_init(); usart_init();
+
+    uint8_t engaged = 0;
+    uint32_t last_toggle_time = 0; 
+    uint32_t last_send_time = 0;
+    char buffer[32];
+    int current_angle = 0;
+
+    GPIOC->ODR |= (1 << 0); // Start Yellow ON
+
+    while (1) {
+        uint32_t now = millis();
+
+        // 1. ESP32 Command Check
+        if (usart_available()) {
+            char c = usart_read();
+            if (c == '1') { engaged = 1; last_toggle_time = now; } 
+            if (c == '0') { engaged = 0; last_toggle_time = now; } 
+        }
+
+        // 2. Local Inputs (IR / Button) - Added edge detection
+        static uint8_t last_ir_state = 0;
+        static uint8_t last_btn_state = 0;
+        
+        uint8_t ir_active = !(GPIOA->IDR & (1 << 1));
+        uint8_t btn_active = !(GPIOC->IDR & (1 << 2));
+
+        // Only toggle on rising edge (0->1 transition) with debounce
+        if (((ir_active && !last_ir_state) || (btn_active && !last_btn_state)) && 
+            (now - last_toggle_time > 300)) {
+            engaged ^= 1; 
+            last_toggle_time = now;
+        }
+        
+        last_ir_state = ir_active;
+        last_btn_state = btn_active;
+
+        // 3. Logic
+        uint16_t pot_val = adc_read();
+        if (engaged) {
+            current_angle = (pot_val * 180) / 4095;
+            GPIOC->ODR &= ~(1<<0); GPIOC->ODR |= (1<<3); // Red ON
+        } else {
+            current_angle = 0;
+            GPIOC->ODR |= (1<<0); GPIOC->ODR &= ~(1<<3); // Yellow ON
+        }
+        set_servo(current_angle);
+
+        // 4. Send Data to ESP32 (Every 200ms)
+        if (now - last_send_time > 200) {
+            sprintf(buffer, "%d,%d\n", engaged, current_angle);
+            usart_print(buffer);
+            last_send_time = now;
+        }
+        delay_us(1000); // Increased to 1ms for stability
+    }
+}
