@@ -44,7 +44,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Musashi Telemetry</title>
+  <title>Disconnect SYstem Control and Telemetry</title>
   <style>
     :root { --bg: #717174ff; --card: #1e1e1e; --text: #ffffffff; --accent: #ffffffff; --green: #00ff88; --red: #ff4d4d; }
     body { font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: var(--bg); color: var(--text); margin: 0; padding: 20px; text-align: center; }
@@ -80,7 +80,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 </head>
 <body>
 <h1>Disconnect System Control & Telemetry System</h1>
-  <h2>Musashi R&D- Material and Elemental Tech. Research Gr.</h2>
+
   
 
   <div class="grid">
@@ -754,4 +754,5 @@ void loop() {
                   data.stm32_ram, data_points);
     last_check = millis();
   }
+
 }
